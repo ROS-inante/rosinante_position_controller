@@ -1,21 +1,3 @@
-# /*
-# * Copyright (C) 2021 Alexander Junk <dev@junk.technology>
-# * 
-# * This program is free software: you can redistribute it and/or modify it 
-# * under the terms of the GNU Lesser General Public License as published 
-# * by the Free Software Foundation, either version 3 of the License, or 
-# * (at your option) any later version.
-# * 
-# * This program is distributed in the hope that it will be useful,
-# * but WITHOUT ANY WARRANTY; 
-# * without even the implied warranty of MERCHANTABILITY or FITNESS
-# * FOR A PARTICULAR PURPOSE. 
-# * See the GNU Lesser General Public License for more details.
-# * 
-# * You should have received a copy of the GNU Lesser General Public License 
-# * along with this program. If not, see <https://www.gnu.org/licenses/>. 
-# *
-# */
 import rclpy
 from rclpy.node import Node
 
@@ -41,6 +23,9 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rosinante_position_controller_interfaces.action import GoToPose
 
 import PyKDL
+
+from simple_pid import PID
+
 
 def transform_to_kdl(t):
     return PyKDL.Frame(PyKDL.Rotation.Quaternion(t.transform.rotation.x, t.transform.rotation.y,
@@ -93,7 +78,7 @@ class BasicPositionController(Node):
 
         self.get_logger().info('!Reading parameters.')
 
-        self.declare_parameter('target_frame', 'map')
+        self.declare_parameter('target_frame', 'odom')
         self.target_frame = self.get_parameter(
             'target_frame').get_parameter_value().string_value
 
@@ -107,7 +92,7 @@ class BasicPositionController(Node):
         self.state_publisher_ = self.create_publisher(String, '/state', 10)
 
         self.cmd_publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
-        timer_period = 0.025  # seconds
+        timer_period = 0.05  # seconds
         self.timer = self.create_timer(timer_period, self.timer_callback_)
         self.i = 0
         
@@ -147,6 +132,14 @@ class BasicPositionController(Node):
             )
 
         self.idle_ = True
+
+
+        self.xy_pid = PID(20, 0.02, 0.5, setpoint=0)
+        self.xy_pid.output_limits = (-1, 1) 
+        self.xy_pid.set_auto_mode(False)
+
+        #self.xy_pid.proportional_on_measurement = True
+
         self.get_logger().info('Position controller initialized!')
 
     def goal_callback(self, goal_request):
@@ -178,6 +171,7 @@ class BasicPositionController(Node):
 
         self.target_pose_ = goal_handle.request.target_pose
         #self.target_pose_.header.frame_id = self.target_frame
+        #self.target_pose_.header.frame_id = 'odom'
         self.target_frame = goal_handle.request.target_pose.header.frame_id
         self.target_active_ = True
 
@@ -216,6 +210,7 @@ class BasicPositionController(Node):
 
         from_frame_rel = self.target_frame
         #from_frame_rel = 'map'
+        #from_frame_rel = 'odom'
         to_frame_rel = 'base_link'
 
         state_msg = String()
@@ -232,6 +227,7 @@ class BasicPositionController(Node):
             self.idle_ = False
             state_msg.data = "running"
             self.state_publisher_.publish(state_msg)
+            self.xy_pid.set_auto_mode(True)
 
         try:
             now = rclpy.time.Time()
@@ -256,7 +252,7 @@ class BasicPositionController(Node):
 
         msg = Twist()
         #scale_rotation_rate = 0.02
-        scale_rotation_rate = 0.2
+        scale_rotation_rate = 0.05
         
         q = pt.pose.orientation
 
@@ -266,58 +262,63 @@ class BasicPositionController(Node):
         abs_yaw = abs(yaw)
         yaw /= abs_yaw
         
-        if(abs_yaw < 2*3.1415/360*0.2):
+        if(abs_yaw < 2*3.1415/360*0.1):
             scale_rotation_rate = 0.00
+        elif(abs_yaw < 2*3.1415/360*0.5):
+            scale_rotation_rate = 0.1
+        elif(abs_yaw < 2*3.1415/360*2):
+            scale_rotation_rate = 0.2
         elif(abs_yaw < 2*3.1415/360*10):
-            scale_rotation_rate = 0.01
+            scale_rotation_rate = 0.2
         
         elif(abs_yaw < 2*3.1415/360*20):
-            scale_rotation_rate = 0.03
+            scale_rotation_rate = 0.2
 
+        scale_rotation_rate = 0.0
+        
         if(yaw > 0):
             msg.angular.z = scale_rotation_rate
         elif(yaw < 0):
             msg.angular.z = -1 * scale_rotation_rate
-
+        else:
+            msg.angular.z = 0
         
         # Safe working speed!
         #scale_forward_speed = 0.03
-        
         #scale_forward_speed = 1.0
         scale_forward_speed = 0.15
 
-        scale_slow = 0.5
+        #msg.linear.x = scale_forward_speed * pt.pose.position.x
+        #msg.linear.y = scale_forward_speed * pt.pose.position.y
         
-        #if(abs_val < 0.001):
-        
-        if(abs_val < 0.01):
-            scale_forward_speed = 0.000
-        elif(abs_val < 0.05):
-            scale_forward_speed = 0.03   
-        elif(abs_val < 0.2):
-            scale_forward_speed = 0.1 * scale_slow 
-        elif(abs_val < 0.5):
-            scale_forward_speed = 0.2 * scale_slow
+        if abs_val <= 0.01:
+            abs_val = 0
 
-        #else:
-        #    scale_forward_speed = 0.3 * scale_slow
+        v = self.xy_pid(abs_val)
+        p, i, d = self.xy_pid.components
+        print(f'{p} ${i} ${d}')
+        print(v)
 
-        msg.linear.x = scale_forward_speed * pt.pose.position.x
-        msg.linear.y = scale_forward_speed * pt.pose.position.y
+      
+
+        msg.linear.x =  abs(v) *  scale_forward_speed * pt.pose.position.x
+        msg.linear.y = abs(v) *  scale_forward_speed * pt.pose.position.y
         
 
         self.current_distance_remaining_ = abs_val
 
         self.cmd_publisher_.publish(msg)
 
-        if not self.target_hold_ and scale_forward_speed == 0.0 and scale_rotation_rate == 0.0:
+        #if not self.target_hold_ and scale_forward_speed == 0.0 and scale_rotation_rate == 0.0:
+        if not self.target_hold_ and abs_val == 0:
             self.target_active_ = False
+            self.xy_pid.set_auto_mode(False)
 
     def pose_subscriber_callback_(self, msg):
         self.get_logger().info('Got: "%s"' % msg)
         self.target_pose_ = msg
         #self.target_pose_.header.frame_id = self.target_frame
-        #self.target_frame = self.target_pose_.header.frame_id
+        self.target_frame = self.target_pose_.header.frame_id
         self.target_active_ = True
 
 def main(args=None):
@@ -343,118 +344,6 @@ def main(args=None):
     # (optional - otherwise it will be done automatically
     # when the garbage collector destroys the node object)
     basic_position_controller.destroy()
-    rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
-
-            return
-
-        try:
-            now = rclpy.time.Time()
-            trans = self.tf_buffer.lookup_transform(
-                to_frame_rel,
-                from_frame_rel,
-                now)
-
-        except TransformException as ex:
-            self.get_logger().info(
-                f'Could not transform {to_frame_rel} to {from_frame_rel}: {ex}')
-            return
-
-        pt = do_transform_pose(self.target_pose_, trans)
-
-        abs_val = sqrt(pt.pose.position.x**2 + pt.pose.position.y**2)
-
-        pt.pose.position.x /= abs_val
-        pt.pose.position.y /= abs_val
-
-        msg = Twist()
-        #scale_rotation_rate = 0.02
-        scale_rotation_rate = 0.2
-        
-        q = pt.pose.orientation
-
-        #msg.angular.z = scale_rotation_rate * pt.pose.orientation.z
-        roll, pitch, yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
-
-        abs_yaw = abs(yaw)
-        yaw /= abs_yaw
-        
-        if(abs_yaw < 2*3.1415/360/2):
-            scale_rotation_rate = 0.00
-        elif(abs_yaw < 2*3.1415/360*1):
-            scale_rotation_rate = 0.005
-        
-        elif(abs_yaw < 2*3.1415/360*5):
-            scale_rotation_rate = 0.05
-
-        if(yaw > 0):
-            msg.angular.z = scale_rotation_rate
-        elif(yaw < 0):
-            msg.angular.z = -1 * scale_rotation_rate
-
-        
-
-        #scale_forward_speed = 0.03
-        scale_forward_speed = 0.3
-        
-        #if(abs_val < 0.001):
-        
-        if(abs_val < 0.01):
-            scale_forward_speed = 0.000
-        elif(abs_val < 0.05):
-            scale_forward_speed = 0.05   
-        elif(abs_val < 0.1):
-            scale_forward_speed = 0.1
-        elif(abs_val < 0.3):
-            scale_forward_speed = 0.2
-        else:
-            scale_forward_speed = 0.3
-
-        msg.linear.x = scale_forward_speed * pt.pose.position.x
-        msg.linear.y = scale_forward_speed * pt.pose.position.y
-
-        self.current_distance_remaining_ = abs_val
-
-        self.cmd_publisher_.publish(msg)
-
-        if not self.target_hold_ and scale_forward_speed == 0.0 and scale_rotation_rate == 0.0:
-            self.target_active_ = False
-
-    def pose_subscriber_callback_(self, msg):
-        self.get_logger().info('Got: "%s"' % msg)
-        self.target_pose_ = msg
-        # self.target_pose_.header.frame_id = self.target_frame
-        self.target_frame = self.target_pose_.header.frame_id
-        self.target_active_ = True
-
-def main(args=None):
-    rclpy.init(args=args)
-
-    basic_position_controller = BasicPositionController()
-
-
-     # MultiThreadedExecutor executes callbacks with a thread pool. If num_threads is not
-    # specified then num_threads will be multiprocessing.cpu_count() if it is implemented.
-    # Otherwise it will use a single thread. This executor will allow callbacks to happen in
-    # parallel, however the MutuallyExclusiveCallbackGroup in DoubleTalker will only allow its
-    # callbacks to be executed one at a time. The callbacks in Listener are free to execute in
-    # parallel to the ones in DoubleTalker however.
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(basic_position_controller)
-    try:
-        executor.spin()
-    finally:
-        executor.shutdown()
-        listener.destroy_node()
-        talker.destroy_node()
-
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-
     rclpy.shutdown()
 
 
